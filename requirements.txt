@@ -1,8 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 beautifulsoup4
 lxml
 requests
 chromadb
-sentence-transformers
+fastembed
