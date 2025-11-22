@@ -2,6 +2,7 @@ import os
 import json
 import time
 import requests
+import re
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -19,14 +20,13 @@ except ImportError:
     pass
 # --------------------------------------------------------------------------
 
-from chromadb import PersistentClient, Settings # Import Settings
+from chromadb import PersistentClient, Settings
 from fastembed.text.text_embedding import TextEmbedding
-# Removed: from chromadb.utils.embedding_functions import FastEmbedEmbeddingFunction (Causes ImportError)
 
 # --- Configuration and Initialization ---
 
 # Check for API Key provided by the runtime environment
-API_KEY = "AIzaSyAptZ-5xnbs7k4Y9Q5PUp1-C8NlyAEzuWY"
+API_KEY = os.environ.get("__api_key", "")
 if not API_KEY:
     # Fallback/Placeholder message if running outside the intended environment
     print("Warning: __api_key environment variable not found. Using empty string.")
@@ -43,7 +43,7 @@ app = FastAPI(
     description="Backend for AI-powered QA and test script generation."
 )
 
-# --- Pydantic Schemas ---
+# --- Pydantic Schemas (omitted for brevity, they are unchanged) ---
 
 class UploadDocsPayload(BaseModel):
     """Payload for ingesting new documents."""
@@ -100,21 +100,14 @@ TEST_CASE_SCHEMA = {
     "propertyOrdering": ["test_case_id", "title", "description", "priority", "steps"]
 }
 
-# --- ChromaDB Setup with fastembed ---
-
-# Note: The fastembed model used by default (BGE-small-en) is very small and fast, keeping the image size low.
+# --- ChromaDB Setup with fastembed (omitted for brevity, unchanged) ---
 
 def get_chroma_client_and_collection():
     """Initializes and returns the ChromaDB client and collection."""
     try:
-        # Get the default fastembed model name is no longer necessary here,
-        # but the TextEmbedding import remains useful for verification.
         model_name = TextEmbedding.list_supported_models()[0]['model']
         print(f"ChromaDB will use fastembed model: {model_name}")
         
-        # Initialize Persistent Client with simplified settings.
-        # This relies on ChromaDB automatically detecting and using fastembed
-        # since the package is installed and no other embedding function is specified.
         client = PersistentClient(
             path=DB_DIR,
             settings=Settings(
@@ -123,15 +116,12 @@ def get_chroma_client_and_collection():
             )
         )
 
-        # Get or create the collection. ChromaDB will use its default embedding function (fastembed)
-        # when the collection is created without an explicit function argument.
         collection = client.get_or_create_collection(
             name=COLLECTION_NAME
         )
         return client, collection
     except Exception as e:
         print(f"Error initializing ChromaDB or fastembed: {e}")
-        # In a real app, this should log and retry or fail gracefully.
         raise RuntimeError(f"Database initialization failed: {e}")
 
 # Global variables for DB (initialized lazily)
@@ -150,9 +140,13 @@ def startup_db_client():
 # --- Gemini API Helper Function (with retry logic) ---
 
 def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) -> Dict[str, Any]:
-    """Handles API calls with exponential backoff."""
+    """Handles API calls with exponential backoff and improved key check."""
     if not API_KEY:
-        raise HTTPException(status_code=503, detail="Gemini API Key is missing.")
+        # Improved error message if the key is missing
+        raise HTTPException(
+            status_code=500, 
+            detail="Gemini API Key is missing. Please ensure the '__api_key' environment variable is set."
+        )
         
     headers = {'Content-Type': 'application/json'}
     
@@ -166,15 +160,17 @@ def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) ->
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
-            # Handle specific HTTP errors (e.g., 429 Rate Limit)
             print(f"HTTP Error on attempt {attempt + 1}: {e}")
             if response.status_code == 429 and attempt < max_retries - 1:
-                delay = 2 ** attempt  # Exponential backoff
+                delay = 2 ** attempt
                 time.sleep(delay)
                 continue
+            # For 400 errors (which often indicate an invalid API key or payload issue)
+            if response.status_code >= 400 and response.status_code < 500:
+                 raise HTTPException(status_code=response.status_code, detail=f"Gemini API Error: Check API Key and Payload. Response: {response.text}")
+            
             raise HTTPException(status_code=response.status_code, detail=f"Gemini API Error: {response.text}")
         except requests.exceptions.RequestException as e:
-            # Handle connection errors, DNS failures, etc.
             print(f"Request Exception on attempt {attempt + 1}: {e}")
             if attempt < max_retries - 1:
                 delay = 2 ** attempt
@@ -185,7 +181,7 @@ def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) ->
     raise HTTPException(status_code=500, detail="Gemini API failed after multiple retries.")
 
 
-# --- Endpoints ---
+# --- Endpoints (omitted for brevity, unchanged functionality) ---
 
 @app.get("/")
 def read_root():
@@ -228,9 +224,6 @@ def upload_docs(payload: UploadDocsPayload):
 
     if not documents:
         return {"status": "warning", "message": "No valid documents or text extracted."}
-
-    # In a production RAG system, documents would be split into smaller chunks here.
-    # For this implementation, we treat each element in `documents` as one chunk/document.
     
     # Generate unique IDs for the documents
     ids = [f"doc_{knowledge_base.count() + i}" for i in range(len(documents))]
@@ -333,15 +326,16 @@ def generate_selenium(payload: SeleniumPayload):
         "Your task is to take a structured test case (provided as a JSON object) and convert it "
         "into a complete, runnable Python script using the `selenium` library. "
         "The script must be self-contained and ready to execute. "
-        "For 'element_identifier' fields, assume they are CSS selectors or element IDs when writing the `find_element` calls. "
-        "Use explicit waits where appropriate. Provide the complete code block."
+        "For 'element_identifier' fields, assume they are descriptive labels (e.g., 'Login button', 'Email input field'). "
+        "You must use the `By.CSS_SELECTOR` or `By.ID` where possible, or use explicit waits with descriptive element IDs/names if available. "
+        "Use `webdriver_manager` to automatically set up the Chrome driver. "
+        "Provide only the complete, executable Python code block."
     )
     
     # User Prompt: The specific instruction for the LLM
     user_query = (
         f"Convert the following structured test case into a complete, runnable Python script "
         f"that uses Selenium WebDriver. Use best practices for locating elements and handling waits. "
-        f"Assume Chrome WebDriver is installed and available in PATH or use `webdriver_manager` for setup. "
         f"The test case is:\n\n{test_case_str}"
     )
     
@@ -356,13 +350,23 @@ def generate_selenium(payload: SeleniumPayload):
     try:
         script_text = api_response['candidates'][0]['content']['parts'][0]['text']
         
-        # Simple extraction of the first Python code block (assuming the model outputs Python code)
-        if '```python' in script_text:
-            script = script_text.split('```python')[1].split('```')[0].strip()
+        # --- FIX: Use regex to extract content between the first ```python and the next ``` ---
+        match = re.search(r'```python\s*(.*?)\s*```', script_text, re.DOTALL)
+        
+        if match:
+            script = match.group(1).strip()
         else:
+            # If no code fence is found, assume the entire output is the script (less common but safer)
             script = script_text.strip()
+            # If the script is still just the literal 'script_text', it means LLM returned only that string.
+            if script.lower() == "script_text":
+                 raise ValueError("LLM returned the literal placeholder 'script_text'. Generation failed.")
             
         return {"script": script}
     except KeyError:
-        raise HTTPException(status_code=500, detail="LLM failed to return a valid script.")
-
+        # If any part of the expected structure is missing
+        raise HTTPException(status_code=500, detail="LLM failed to return a valid script structure.")
+    except Exception as e:
+        print(f"Script extraction failed: {e}. Raw response: {script_text[:100]}...")
+        # If extraction or parsing fails, return the raw text for debugging
+        return {"script": f"Error: Failed to generate script. Raw LLM output: {script_text}", "detail": str(e)}
