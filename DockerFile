@@ -22,17 +22,18 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
 
 # --- CRITICAL STEP: AGGRESSIVE PRUNING FOR SIZE REDUCTION ---
-# We delete known massive, unnecessary files (CUDA/NVIDIA) to shrink the final image.
-RUN # 1. Delete CUDA/NVIDIA library components from PyTorch
-    find /venv/lib/ -type d -name "nvidia" -exec rm -rf {} + && \
-    find /venv/lib/ -type d -name "torch_cuda_cu12" -exec rm -rf {} + && \
+# This step explicitly removes known massive, unnecessary GPU libraries (CUDA/NVIDIA) 
+# and ONNX runtime components, which are not needed on CPU-only infrastructure, 
+# resulting in a final image that is hundreds of MB smaller.
+RUN echo "Aggressively pruning GPU libraries and caches..." && \
+    # 1. Remove NVIDIA/CUDA components from PyTorch and related libraries
+    rm -rf /venv/lib/python*/site-packages/nvidia_* && \
+    rm -rf /venv/lib/python*/site-packages/torch/lib/libcuda* && \
+    rm -rf /venv/lib/python*/site-packages/torch/lib/libnv* && \
+    rm -rf /venv/lib/python*/site-packages/torch/lib/torch_cuda_cu* && \
     # 2. Delete ONNX runtime CUDA components
-    rm -rf /venv/lib/python3.11/site-packages/onnxruntime/capi/cuda* && \
-    # 3. Use find to delete common large files that slip through (like libcuda files)
-    find /venv/ -name "libcuda*" -delete && \
-    find /venv/ -name "libcudnn*" -delete && \
-    find /venv/ -name "libcublas*" -delete && \
-    # 4. Clean up the pip cache
+    rm -rf /venv/lib/python*/site-packages/onnxruntime/capi/cuda* && \
+    # 3. Clean up the pip cache
     rm -rf /root/.cache/pip
 
 # --- STAGE 2: FINAL IMAGE (The Minimal Runner) ---
