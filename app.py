@@ -19,9 +19,9 @@ except ImportError:
     pass
 # --------------------------------------------------------------------------
 
-from chromadb import PersistentClient
+from chromadb import PersistentClient, Settings # Import Settings
 from fastembed.text.text_embedding import TextEmbedding
-from chromadb.utils.embedding_functions import FastEmbedEmbeddingFunction # 👈 FIX: Using the correct, lightweight function
+# Removed: from chromadb.utils.embedding_functions import FastEmbedEmbeddingFunction (Causes ImportError)
 
 # --- Configuration and Initialization ---
 
@@ -107,20 +107,27 @@ TEST_CASE_SCHEMA = {
 def get_chroma_client_and_collection():
     """Initializes and returns the ChromaDB client and collection."""
     try:
-        # We explicitly use the FastEmbedEmbeddingFunction provided by chromadb,
-        # which eliminates the dependency on the heavy sentence-transformers package.
-        embedding_function = FastEmbedEmbeddingFunction(
-            model_name=TextEmbedding.list_supported_models()[0]['model'],
-            device='cpu' # Ensure it runs on CPU
-        )
+        # Get the default fastembed model name for consistency
+        model_name = TextEmbedding.list_supported_models()[0]['model']
         
-        # Initialize Persistent Client (stores data on disk in DB_DIR)
-        client = PersistentClient(path=DB_DIR)
+        # Initialize Persistent Client with explicit embedding function configuration
+        # This uses the default fastembed integration provided by chromadb settings, 
+        # avoiding the ImportError for FastEmbedEmbeddingFunction
+        client = PersistentClient(
+            path=DB_DIR,
+            settings=Settings(
+                anonymized_telemetry=False,
+                is_persistent=True,
+                # Configure the built-in fastembed function and model
+                embedding_function="fastembed",
+                fastembed_embedding_model=model_name
+            )
+        )
 
-        # Get or create the collection with the fastembed function
+        # Get or create the collection. When creating, we no longer pass an explicit embedding_function
+        # object, as it is configured globally via the client settings.
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=embedding_function
+            name=COLLECTION_NAME
         )
         return client, collection
     except Exception as e:
