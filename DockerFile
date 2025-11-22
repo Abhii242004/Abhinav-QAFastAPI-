@@ -1,11 +1,11 @@
 # --- STAGE 1: BUILDER (The Heavy Lifter) ---
-# Use a full Python image for stability during compilation.
-FROM python:3.11 AS builder
+# Use the full Python image for installing dependencies
+FROM python:3.11-bullseye AS builder
 
 # Set the working directory
 WORKDIR /app
 
-# Install minimum system dependencies needed for compiling ML packages
+# Install minimum system dependencies needed for compiling small packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -18,27 +18,15 @@ COPY requirements.txt .
 RUN python -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 
-# Install Python dependencies with a generous timeout.
+# Install Python dependencies. fastembed is much smaller than sentence-transformers.
 RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
 
-# --- CRITICAL STEP: AGGRESSIVE PRUNING FOR SIZE REDUCTION ---
-# This step explicitly removes known massive, unnecessary GPU libraries (CUDA/NVIDIA) 
-# and ONNX runtime components, which are not needed on CPU-only infrastructure, 
-# resulting in a final image that is hundreds of MB smaller.
-RUN echo "Aggressively pruning GPU libraries and caches..." && \
-    # 1. Remove NVIDIA/CUDA components from PyTorch and related libraries
-    rm -rf /venv/lib/python*/site-packages/nvidia_* && \
-    rm -rf /venv/lib/python*/site-packages/torch/lib/libcuda* && \
-    rm -rf /venv/lib/python*/site-packages/torch/lib/libnv* && \
-    rm -rf /venv/lib/python*/site-packages/torch/lib/torch_cuda_cu* && \
-    # 2. Delete ONNX runtime CUDA components
-    rm -rf /venv/lib/python*/site-packages/onnxruntime/capi/cuda* && \
-    # 3. Clean up the pip cache
-    rm -rf /root/.cache/pip
+# Clean up the pip cache for minimal size
+RUN rm -rf /root/.cache/pip
 
 # --- STAGE 2: FINAL IMAGE (The Minimal Runner) ---
-# Use a minimal, slim Python image for the final, deployed image.
-FROM python:3.11-slim
+# Use the absolute slimmest Python image for the final deployment.
+FROM python:3.11-slim-bullseye
 
 # Set environment variables
 ENV PYTHONUNBUFFERED 1
