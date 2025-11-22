@@ -1,36 +1,57 @@
-# Use a lightweight official Python image suitable for production
+# --- STAGE 1: BUILDER (The Heavy Lifter) ---
+# Use a full Python image for stability during compilation.
+FROM python:3.11 AS builder
+
+# Set the working directory
+WORKDIR /app
+
+# Install minimum system dependencies needed for compiling ML packages
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    # Clean up apt cache immediately after installation
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install packages into a virtual environment
+COPY requirements.txt .
+RUN python -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# Install Python dependencies with a generous timeout.
+RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
+
+# --- CRITICAL STEP: AGGRESSIVE PRUNING FOR SIZE REDUCTION ---
+# We delete known massive, unnecessary files (CUDA/NVIDIA) to shrink the final image.
+RUN # 1. Delete CUDA/NVIDIA library components from PyTorch
+    find /venv/lib/ -type d -name "nvidia" -exec rm -rf {} + && \
+    find /venv/lib/ -type d -name "torch_cuda_cu12" -exec rm -rf {} + && \
+    # 2. Delete ONNX runtime CUDA components
+    rm -rf /venv/lib/python3.11/site-packages/onnxruntime/capi/cuda* && \
+    # 3. Use find to delete common large files that slip through (like libcuda files)
+    find /venv/ -name "libcuda*" -delete && \
+    find /venv/ -name "libcudnn*" -delete && \
+    find /venv/ -name "libcublas*" -delete && \
+    # 4. Clean up the pip cache
+    rm -rf /root/.cache/pip
+
+# --- STAGE 2: FINAL IMAGE (The Minimal Runner) ---
+# Use a minimal, slim Python image for the final, deployed image.
 FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED 1
 ENV PYTHONDONTWRITEBYTECODE 1
 
-# Set the working directory in the container
+# Set the working directory
 WORKDIR /app
 
-# 1. Copy only requirements.txt first to leverage Docker caching.
-COPY requirements.txt .
-
-# 2. Install Dependencies, Build Tools, and then CLEAN UP immediately.
-# This chained RUN command minimizes layers and drastically reduces the final image size
-# by removing the build tools (like build-essential) after they are no longer needed.
-RUN apt-get update && \
-    # Install build tools needed for packages like lxml, numpy, etc.
-    apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/* && \
-    \
-    # Install Python dependencies with a generous timeout (300 seconds)
-    pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --timeout 300 -r requirements.txt && \
-    \
-    # CLEAN UP: Uninstall the build tools to shrink the final image size
-    apt-get purge -y --auto-remove build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-# 3. Copy the rest of the application code
+# Copy the application code
 COPY . .
 
-# 4. Define the command to run your application
-# The host/port are picked up automatically by Railway.
+# Copy the *pre-built and PRUNED* virtual environment from the builder stage
+COPY --from=builder /venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# Define the command to run your application
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "$PORT"]
