@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN python -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 
-# Install Python dependencies. fastembed is much smaller than sentence-transformers.
+# Install Python dependencies. This step will now include pysqlite3-binary.
 RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
 
 # Clean up the pip cache for minimal size
