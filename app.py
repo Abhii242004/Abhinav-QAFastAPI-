@@ -107,25 +107,24 @@ TEST_CASE_SCHEMA = {
 def get_chroma_client_and_collection():
     """Initializes and returns the ChromaDB client and collection."""
     try:
-        # Get the default fastembed model name for consistency
+        # Get the default fastembed model name is no longer necessary here,
+        # but the TextEmbedding import remains useful for verification.
         model_name = TextEmbedding.list_supported_models()[0]['model']
+        print(f"ChromaDB will use fastembed model: {model_name}")
         
-        # Initialize Persistent Client with explicit embedding function configuration
-        # This uses the default fastembed integration provided by chromadb settings, 
-        # avoiding the ImportError for FastEmbedEmbeddingFunction
+        # Initialize Persistent Client with simplified settings.
+        # This relies on ChromaDB automatically detecting and using fastembed
+        # since the package is installed and no other embedding function is specified.
         client = PersistentClient(
             path=DB_DIR,
             settings=Settings(
                 anonymized_telemetry=False,
                 is_persistent=True,
-                # Configure the built-in fastembed function and model
-                embedding_function="fastembed",
-                fastembed_embedding_model=model_name
             )
         )
 
-        # Get or create the collection. When creating, we no longer pass an explicit embedding_function
-        # object, as it is configured globally via the client settings.
+        # Get or create the collection. ChromaDB will use its default embedding function (fastembed)
+        # when the collection is created without an explicit function argument.
         collection = client.get_or_create_collection(
             name=COLLECTION_NAME
         )
