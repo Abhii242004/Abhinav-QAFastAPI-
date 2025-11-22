@@ -42,5 +42,7 @@ COPY . .
 COPY --from=builder /venv /venv
 ENV PATH="/venv/bin:$PATH"
 
-# Define the command to run your application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "$PORT"]
+# Define the command to run your application using the shell form.
+# This uses ${PORT:-8080} to substitute the $PORT variable, defaulting to 8080 if $PORT is unset.
+# This shell form is necessary to correctly expand $PORT into an integer.
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}
