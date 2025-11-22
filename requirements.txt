@@ -6,3 +6,4 @@ lxml
 requests
 chromadb
 fastembed
+pysqlite3-binary
