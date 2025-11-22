@@ -7,6 +7,18 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
+
+# CRITICAL FIX for SQLite version incompatibility on Linux slim images
+# This imports the modern, bundled pysqlite3 and forces the standard 'sqlite3'
+# module to use it, satisfying ChromaDB's requirement (version >= 3.35.0).
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
+# --------------------------------------------------------------------------
+
 from chromadb import PersistentClient
 from fastembed.text.text_embedding import TextEmbedding
 from chromadb.utils import embedding_functions
