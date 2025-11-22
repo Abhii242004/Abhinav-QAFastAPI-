@@ -21,7 +21,7 @@ except ImportError:
 
 from chromadb import PersistentClient
 from fastembed.text.text_embedding import TextEmbedding
-from chromadb.utils import embedding_functions
+from chromadb.utils.embedding_functions import FastEmbedEmbeddingFunction # 👈 FIX: Using the correct, lightweight function
 
 # --- Configuration and Initialization ---
 
@@ -102,16 +102,14 @@ TEST_CASE_SCHEMA = {
 
 # --- ChromaDB Setup with fastembed ---
 
-# We define a custom embedding function based on fastembed, which replaces the heavy sentence-transformers.
-# fastembed handles model downloading and initialization efficiently.
 # Note: The fastembed model used by default (BGE-small-en) is very small and fast, keeping the image size low.
 
 def get_chroma_client_and_collection():
     """Initializes and returns the ChromaDB client and collection."""
     try:
-        # fastembed model is loaded on demand.
-        # We use SentenceTransformerEmbeddingFunction but point it to the fastembed model.
-        embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+        # We explicitly use the FastEmbedEmbeddingFunction provided by chromadb,
+        # which eliminates the dependency on the heavy sentence-transformers package.
+        embedding_function = FastEmbedEmbeddingFunction(
             model_name=TextEmbedding.list_supported_models()[0]['model'],
             device='cpu' # Ensure it runs on CPU
         )
