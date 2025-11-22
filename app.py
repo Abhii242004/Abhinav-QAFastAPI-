@@ -26,7 +26,7 @@ from fastembed.text.text_embedding import TextEmbedding
 # --- Configuration and Initialization ---
 
 # Check for API Key provided by the runtime environment
-API_KEY = os.environ.get("__api_key", "")
+API_KEY = "AIzaSyAptZ-5xnbs7k4Y9Q5PUp1-C8NlyAEzuWY"
 if not API_KEY:
     # Fallback/Placeholder message if running outside the intended environment
     print("Warning: __api_key environment variable not found. Using empty string.")
@@ -365,3 +365,4 @@ def generate_selenium(payload: SeleniumPayload):
         return {"script": script}
     except KeyError:
         raise HTTPException(status_code=500, detail="LLM failed to return a valid script.")
+
