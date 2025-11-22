@@ -1,317 +1,351 @@
-# app.py - Monolithic Backend Application
-# Combines Vector Store, Document Ingestion, Test Case Generation, and Selenium Scripting.
-
-# --- 1. CORE IMPORTS AND CONFIGURATION ---
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, model_validator
-from typing import List, Dict, Any, Optional
-import hashlib
-import time
-import json
 import os
+import json
+import time
 import requests
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
-import chromadb
-from sentence_transformers import SentenceTransformer
+from chromadb import PersistentClient
+from fastembed.text.text_embedding import TextEmbedding
+from chromadb.utils import embedding_functions
 
-# LLM API Configuration
-API_KEY = "" # Leave as-is; Canvas provides this at runtime.
-API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
+# --- Configuration and Initialization ---
 
-# Vector Store Configuration
-DB_PATH = "chroma_test_db"
-COLLECTION_NAME = "test_knowledge_base"
+# Check for API Key provided by the runtime environment
+API_KEY = os.environ.get("__api_key", "")
+if not API_KEY:
+    # Fallback/Placeholder message if running outside the intended environment
+    print("Warning: __api_key environment variable not found. Using empty string.")
 
+# API Endpoint and Model
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
+MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+DB_DIR = "chroma_test_db"
+COLLECTION_NAME = "qa_knowledge_base"
 
-# --- 2. PYDANTIC SCHEMAS (DATA MODELS) ---
+# Initialize FastAPI app
+app = FastAPI(
+    title="Monolithic QA Automation & RAG Service",
+    description="Backend for AI-powered QA and test script generation."
+)
 
-class UploadRequest(BaseModel):
-    """Schema for the /upload_docs endpoint."""
-    docs: List[str] # List of raw text lines or content items
-    html: str      # Raw HTML string to be processed
+# --- Pydantic Schemas ---
 
-class QueryRequest(BaseModel):
-    """Schema for the /generate_test_cases endpoint."""
-    query: str
+class UploadDocsPayload(BaseModel):
+    """Payload for ingesting new documents."""
+    docs: List[str] = Field(..., description="List of text documents to ingest.")
+    html: Optional[str] = Field(None, description="Optional raw HTML content to extract text from.")
 
-class TestCaseRequest(BaseModel):
-    """Schema for the /generate_selenium endpoint."""
-    test_case: Dict # Expects a dictionary matching the structure of GeneratedTestCase
+class QueryPayload(BaseModel):
+    """Payload for query-based operations."""
+    query: str = Field(..., description="The user query or description.")
+
+class SeleniumPayload(BaseModel):
+    """Payload for generating Selenium scripts."""
+    test_case: Dict[str, Any] = Field(..., description="The structured test case output from /generate_test_cases.")
 
 class TestStep(BaseModel):
-    """Defines a single step in a test case for structured LLM output."""
-    action: str  # e.g., "Click button", "Fill form", "Verify text"
-    element: str # e.g., "Login button with text 'Sign In'", "Input field with name 'username'"
-    value: Optional[str] = None # e.g., "testuser@example.com" if action is "Fill form"
+    """A single step in the structured test case."""
+    step_number: int
+    action: str = Field(..., description="The action to perform (e.g., 'Click', 'Enter text', 'Verify').")
+    element_identifier: str = Field(..., description="CSS Selector, XPath, or human-readable description of the UI element.")
+    test_data: Optional[str] = Field(None, description="Data to input (e.g., 'user@example.com', 'password123').")
+    expected_result: str = Field(..., description="The expected outcome after performing the action.")
 
 class GeneratedTestCase(BaseModel):
-    """The structured output schema for the TestCaseAgent."""
-    test_case_name: str = Field(..., description="A short, descriptive name for the test case.")
-    description: str = Field(..., description="A detailed explanation of the test case objective.")
-    steps: List[TestStep] = Field(..., description="A sequence of detailed steps to execute the test.")
+    """The structured output for a test case."""
+    test_case_id: str
+    title: str = Field(..., description="A concise title for the test case.")
+    description: str = Field(..., description="A brief overview of the test objective.")
+    priority: str = Field("Medium", description="Priority level: High, Medium, or Low.")
+    steps: List[TestStep]
+    
+# JSON Schema for Structured Generation (used in the API call)
+TEST_CASE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "test_case_id": {"type": "STRING"},
+        "title": {"type": "STRING"},
+        "description": {"type": "STRING"},
+        "priority": {"type": "STRING", "enum": ["High", "Medium", "Low"]},
+        "steps": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "step_number": {"type": "INTEGER"},
+                    "action": {"type": "STRING"},
+                    "element_identifier": {"type": "STRING"},
+                    "test_data": {"type": "STRING"},
+                    "expected_result": {"type": "STRING"}
+                },
+                "propertyOrdering": ["step_number", "action", "element_identifier", "test_data", "expected_result"]
+            }
+        }
+    },
+    "propertyOrdering": ["test_case_id", "title", "description", "priority", "steps"]
+}
 
+# --- ChromaDB Setup with fastembed ---
 
-# --- 3. UTILITY FUNCTIONS ---
+# We define a custom embedding function based on fastembed, which replaces the heavy sentence-transformers.
+# fastembed handles model downloading and initialization efficiently.
+# Note: The fastembed model used by default (BGE-small-en) is very small and fast, keeping the image size low.
 
-async def _call_llm_api(system_prompt: str, user_query: str, structured_schema: Optional[BaseModel] = None, context: Optional[str] = None) -> str:
-    """
-    Calls the Gemini API with exponential backoff and optional structured output.
-    """
-    if context:
-        user_query = f"Context from Knowledge Base:\n---\n{context}\n---\n\nUser Request: {user_query}"
+def get_chroma_client_and_collection():
+    """Initializes and returns the ChromaDB client and collection."""
+    try:
+        # fastembed model is loaded on demand.
+        # We use SentenceTransformerEmbeddingFunction but point it to the fastembed model.
+        embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=TextEmbedding.list_supported_models()[0]['model'],
+            device='cpu' # Ensure it runs on CPU
+        )
         
-    payload = {
-        "contents": [{"parts": [{"text": user_query}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]}
-    }
+        # Initialize Persistent Client (stores data on disk in DB_DIR)
+        client = PersistentClient(path=DB_DIR)
 
+        # Get or create the collection with the fastembed function
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_function
+        )
+        return client, collection
+    except Exception as e:
+        print(f"Error initializing ChromaDB or fastembed: {e}")
+        # In a real app, this should log and retry or fail gracefully.
+        raise RuntimeError(f"Database initialization failed: {e}")
+
+# Global variables for DB (initialized lazily)
+chroma_client = None
+knowledge_base = None
+
+@app.on_event("startup")
+def startup_db_client():
+    """Initialize the database client on application startup."""
+    global chroma_client, knowledge_base
+    if not chroma_client:
+        chroma_client, knowledge_base = get_chroma_client_and_collection()
+    print(f"ChromaDB initialized. Knowledge base size: {knowledge_base.count()} documents.")
+
+
+# --- Gemini API Helper Function (with retry logic) ---
+
+def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) -> Dict[str, Any]:
+    """Handles API calls with exponential backoff."""
+    if not API_KEY:
+        raise HTTPException(status_code=503, detail="Gemini API Key is missing.")
+        
     headers = {'Content-Type': 'application/json'}
     
-    if structured_schema:
-        payload["generationConfig"] = {
-            "responseMimeType": "application/json",
-            "responseSchema": structured_schema.model_json_schema()
-        }
-    
-    # Exponential backoff logic
-    max_retries = 3
-    delay = 1.0
     for attempt in range(max_retries):
         try:
             response = requests.post(
-                f"{API_URL}?key={API_KEY}",
+                f"{GEMINI_API_URL}?key={API_KEY}",
                 headers=headers,
                 data=json.dumps(payload)
             )
             response.raise_for_status()
-            
-            result = response.json()
-            
-            # Extract content from the result structure
-            if result.get('candidates') and result['candidates'][0].get('content'):
-                text = result['candidates'][0]['content']['parts'][0]['text']
-                return text
-
-            raise ValueError("LLM response was successful but content part is missing.")
-
-        except (requests.exceptions.RequestException, ValueError) as e:
-            if attempt < max_retries - 1 and response.status_code in [429, 500, 503]:
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            # Handle specific HTTP errors (e.g., 429 Rate Limit)
+            print(f"HTTP Error on attempt {attempt + 1}: {e}")
+            if response.status_code == 429 and attempt < max_retries - 1:
+                delay = 2 ** attempt  # Exponential backoff
                 time.sleep(delay)
-                delay *= 2  # Exponential backoff
                 continue
-            
-            print(f"LLM API Error: {e} | Last Response: {response.text}")
-            raise HTTPException(status_code=500, detail=f"LLM API call failed: {e}")
-
-    raise HTTPException(status_code=500, detail="LLM API call failed after multiple retries.")
-
-
-# --- 4. CORE CLASSES ---
-
-class VectorStore:
-    """Manages ChromaDB operations: setup, embedding, chunking, and querying."""
-    def __init__(self):
-        try:
-            self.client = chromadb.PersistentClient(path=DB_PATH) 
-            self.collection = self.client.get_or_create_collection(COLLECTION_NAME)
-            self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
-            self.chunk_size = 500
-        except Exception as e:
-            print(f"Error initializing VectorStore: {e}")
-            raise
-
-    def _get_embedding(self, text: str) -> List[float]:
-        """Generates embeddings for a given text."""
-        return self.embedder.encode(text).tolist()
-
-    def _generate_id(self, source: str, content: str) -> str:
-        """Generates a consistent ID."""
-        data = f"{source}-{content}"
-        return hashlib.sha256(data.encode()).hexdigest()
-
-    def add_document(self, text: str, source: str) -> int:
-        """Splits text into chunks and adds them to the database."""
-        if not text.strip():
-            return 0
-
-        # Simple chunking logic
-        chunks = [text[i:i + self.chunk_size] for i in range(0, len(text), self.chunk_size)]
-        
-        ids, embeddings, metadatas, documents = [], [], [], []
-        
-        for i, chunk in enumerate(chunks):
-            ids.append(self._generate_id(source, chunk))
-            embeddings.append(self._get_embedding(chunk))
-            metadatas.append({"source": source, "chunk_index": i})
-            documents.append(chunk)
-
-        self.collection.add(
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
-        )
-        return len(chunks)
-
-    def get_context(self, query: str, n_results: int = 5) -> str:
-        """Retrieves and concatenates relevant text chunks based on a query."""
-        if not self.collection.count():
-            return "No documents available in the knowledge base."
-            
-        query_embedding = self._get_embedding(query)
-        
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            include=['documents']
-        )
-        
-        context_chunks = results['documents'][0] if results.get('documents') and results['documents'][0] else []
-        return "\n---\n".join(context_chunks)
-
-class DocumentIngestor:
-    """Handles the processing of raw documents and passing them to the VectorStore."""
-    def __init__(self, vector_store: VectorStore):
-        self.vector_store = vector_store
-
-    def _clean_html(self, html_content: str, source: str) -> str:
-        """Uses BeautifulSoup to extract clean text from HTML."""
-        if not html_content.strip():
-            return ""
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            # Remove scripts, styles, and navigational elements
-            for script_or_style in soup(['script', 'style', 'header', 'footer', 'nav']):
-                script_or_style.decompose()
-            
-            text = soup.get_text()
-            # Clean up excessive whitespace
-            clean_text = ' '.join(text.split()).strip()
-            return clean_text
-        except Exception as e:
-            print(f"Error cleaning HTML from source {source}: {e}")
-            return ""
-
-    def process_documents(self, docs: List[str], html: str):
-        """Processes the list of raw text items and the HTML string."""
-        total_chunks = 0
-        
-        # 1. Process HTML Content
-        cleaned_html_text = self._clean_html(html, source="HTML_Input")
-        if cleaned_html_text:
-            total_chunks += self.vector_store.add_document(cleaned_html_text, source="HTML_Input")
-        
-        # 2. Process list of raw text documents/lines
-        for i, doc_content in enumerate(docs):
-            if doc_content.strip():
-                source_id = f"Text_Doc_{i}"
-                total_chunks += self.vector_store.add_document(doc_content, source=source_id)
-        
-        return total_chunks
-
-class TestCaseAgent:
-    """Agent responsible for generating structured test cases using RAG and LLM."""
-    def __init__(self, vector_store: VectorStore):
-        self.vector_store = vector_store
-        self.system_prompt = (
-            "You are an expert QA Engineer. Your task is to generate one complete, "
-            "detailed functional test case based on the user's query and the provided context. "
-            "You MUST use the exact JSON schema provided for your response. "
-            "Ensure the element descriptions in the steps are specific enough for a QA automation tool."
-        )
-
-    async def generate_cases(self, query: str) -> Dict:
-        """Retrieves context and calls LLM for structured test case generation."""
-        context = self.vector_store.get_context(query, n_results=10)
-        
-        llm_response_text = await _call_llm_api(
-            system_prompt=self.system_prompt,
-            user_query=query,
-            structured_schema=GeneratedTestCase,
-            context=context
-        )
-        
-        # The LLM response is already a JSON string matching the schema
-        try:
-            return json.loads(llm_response_text)
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse LLM JSON response: {e}, Raw text: {llm_response_text}")
-            raise HTTPException(status_code=500, detail="Failed to generate structured test case from LLM.")
-
-class SeleniumScriptAgent:
-    """Agent responsible for translating a structured test case into a Python Selenium script."""
-    def __init__(self, vector_store: VectorStore):
-        # We include the vector_store primarily to match the original structure,
-        # but the agent operates without RAG context for this specific task.
-        self.vector_store = vector_store
-        self.system_prompt = (
-            "You are an expert in Python and Selenium WebDriver. "
-            "Your task is to convert the provided structured test case (JSON dictionary) into a complete, "
-            "runnable Python script using the Selenium library. "
-            "The script must include setup/teardown using a WebDriver (assume Chrome is installed), "
-            "and use appropriate selectors (like By.XPATH, By.ID, or By.NAME) based on the element descriptions."
-            "DO NOT include any explanation or commentary, ONLY output the Python code."
-        )
-
-    async def generate_script(self, test_case: Dict) -> str:
-        """Calls LLM to generate the Selenium script based on the test case dictionary."""
-        
-        # We pass the structured test case directly as the user query
-        user_query = f"Convert the following structured test case into a Python Selenium script:\n{json.dumps(test_case, indent=2)}"
-        
-        selenium_script = await _call_llm_api(
-            system_prompt=self.system_prompt,
-            user_query=user_query,
-            structured_schema=None, # Expect raw text output (the code)
-            context=None
-        )
-        
-        # Clean up any markdown code fences the LLM might include
-        if selenium_script.startswith("```python"):
-            selenium_script = selenium_script.strip("```python").strip("`")
-        
-        return selenium_script
+            raise HTTPException(status_code=response.status_code, detail=f"Gemini API Error: {response.text}")
+        except requests.exceptions.RequestException as e:
+            # Handle connection errors, DNS failures, etc.
+            print(f"Request Exception on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                time.sleep(delay)
+                continue
+            raise HTTPException(status_code=500, detail="Gemini API request failed.")
+    
+    raise HTTPException(status_code=500, detail="Gemini API failed after multiple retries.")
 
 
-# --- 5. FASTAPI APPLICATION & ROUTES ---
-# Initialize the application and core components
-app = FastAPI(
-    title="Monolithic QA Automation & RAG Service",
-    description="A unified backend for data ingestion and AI-powered test case/script generation."
-)
-vector_store = VectorStore()
-ingestor = DocumentIngestor(vector_store)
-test_case_agent = TestCaseAgent(vector_store)
-selenium_agent = SeleniumScriptAgent(vector_store)
+# --- Endpoints ---
 
+@app.get("/")
+def read_root():
+    """Basic health check and environment info."""
+    db_count = knowledge_base.count() if knowledge_base else "N/A (DB not initialized)"
+    return {
+        "status": "ok",
+        "message": "QA Automation Service Running",
+        "db_document_count": db_count,
+        "model_used": MODEL_NAME
+    }
 
 @app.post("/upload_docs")
-async def upload_docs(payload: UploadRequest):
+def upload_docs(payload: UploadDocsPayload):
     """
-    Ingests documents (raw text list and HTML content) into the vector store.
+    Ingests raw text and/or HTML content into the ChromaDB vector store.
     """
+    global knowledge_base
+
+    if not knowledge_base:
+        raise HTTPException(status_code=500, detail="Database not initialized.")
+
+    documents = []
+
+    # 1. Process raw text documents
+    if payload.docs:
+        documents.extend(payload.docs)
+
+    # 2. Process HTML content
+    if payload.html:
+        try:
+            soup = BeautifulSoup(payload.html, 'lxml')
+            # Extract main readable text, ignoring scripts, styles, etc.
+            text_content = soup.get_text(separator='\n', strip=True)
+            if text_content:
+                documents.append(f"HTML Content:\n{text_content}")
+        except Exception as e:
+            print(f"Error processing HTML: {e}")
+            raise HTTPException(status_code=400, detail="Invalid HTML content provided.")
+
+    if not documents:
+        return {"status": "warning", "message": "No valid documents or text extracted."}
+
+    # In a production RAG system, documents would be split into smaller chunks here.
+    # For this implementation, we treat each element in `documents` as one chunk/document.
+    
+    # Generate unique IDs for the documents
+    ids = [f"doc_{knowledge_base.count() + i}" for i in range(len(documents))]
+
     try:
-        chunks_added = ingestor.process_documents(payload.docs, payload.html)
-        return {"status": "Knowledge Base Built", "chunks_added": chunks_added}
+        knowledge_base.add(
+            documents=documents,
+            ids=ids,
+            metadatas=[{"source": "user_upload", "id": i} for i in range(len(documents))]
+        )
+        return {
+            "status": "success",
+            "message": "Documents ingested into the knowledge base.",
+            "chunks_added": len(documents)
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed during document ingestion: {e}")
+        print(f"ChromaDB add error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add documents to vector store.")
 
 
-@app.post("/generate_test_cases")
-async def generate_test_cases(payload: QueryRequest):
+@app.post("/generate_test_cases", response_model=GeneratedTestCase)
+def generate_test_cases(payload: QueryPayload):
     """
-    Generates a structured test case using RAG/LLM based on the query.
+    Generates a structured test case (JSON) based on the user's query and RAG context.
     """
-    if not vector_store.collection.count():
-        raise HTTPException(status_code=404, detail="Knowledge base is empty. Please upload documents first via /upload_docs.")
+    global knowledge_base
+
+    if not knowledge_base:
+        raise HTTPException(status_code=500, detail="Database not initialized.")
+
+    query = payload.query
+
+    # 1. RAG Retrieval Step: Find relevant context
+    try:
+        results = knowledge_base.query(
+            query_texts=[query],
+            n_results=3, # Retrieve top 3 relevant documents
+            include=['documents']
+        )
+        context = "\n---\n".join(results['documents'][0]) if results['documents'] and results['documents'][0] else "No relevant context found."
+    except Exception as e:
+        print(f"ChromaDB query error: {e}")
+        raise HTTPException(status_code=500, detail="RAG retrieval failed.")
+
+    # 2. LLM Generation Step (Structured Output)
+    
+    # System Instruction: Guide the model's persona and output format
+    system_prompt = (
+        "You are an expert QA Engineer. Your task is to generate a comprehensive, structured test case "
+        "in the exact JSON format provided in the schema. Use the provided RAG Context to inform "
+        "the precise details for UI interactions (e.g., specific form fields, expected messages). "
+        "Ensure 'element_identifier' is a precise description (e.g., 'Login button', 'Email input field')."
+    )
+    
+    # User Prompt: The specific instruction for the LLM
+    user_query = (
+        f"Based on the following knowledge context, generate a detailed test case for the user request:\n\n"
+        f"USER REQUEST: {query}\n\n"
+        f"KNOWLEDGE CONTEXT:\n{context}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": TEST_CASE_SCHEMA
+        }
+    }
+
+    api_response = call_gemini_api_with_retry(payload)
+    
+    try:
+        # The result text contains the JSON string
+        json_string = api_response['candidates'][0]['content']['parts'][0]['text']
+        test_case_data = json.loads(json_string)
         
-    return await test_case_agent.generate_cases(payload.query)
+        # Validate the generated data against the Pydantic model
+        return GeneratedTestCase(**test_case_data)
+    except (KeyError, json.JSONDecodeError, ValueError) as e:
+        print(f"Failed to parse or validate JSON response: {e}")
+        print(f"Raw API response: {api_response}")
+        raise HTTPException(status_code=500, detail="LLM failed to return valid structured JSON.")
 
 
 @app.post("/generate_selenium")
-async def generate_selenium(payload: TestCaseRequest):
+def generate_selenium(payload: SeleniumPayload):
     """
-    Generates a Python Selenium script from a structured test case dictionary.
+    Converts a structured test case (JSON) into a runnable Python Selenium script.
+    Uses Google Search grounding for up-to-date Selenium syntax/best practices.
     """
-    script_content = await selenium_agent.generate_script(payload.test_case)
-    return {"script": script_content}
+    # 1. Format the JSON test case into a readable string
+    test_case_str = json.dumps(payload.test_case, indent=2)
+
+    # 2. LLM Generation Step (Code Generation with Grounding)
+    
+    # System Instruction: Guide the model for Python code generation and best practices
+    system_prompt = (
+        "You are an expert Python programmer specializing in Selenium WebDriver automation. "
+        "Your task is to take a structured test case (provided as a JSON object) and convert it "
+        "into a complete, runnable Python script using the `selenium` library. "
+        "The script must be self-contained and ready to execute. "
+        "For 'element_identifier' fields, assume they are CSS selectors or element IDs when writing the `find_element` calls. "
+        "Use explicit waits where appropriate. Provide the complete code block."
+    )
+    
+    # User Prompt: The specific instruction for the LLM
+    user_query = (
+        f"Convert the following structured test case into a complete, runnable Python script "
+        f"that uses Selenium WebDriver. Use best practices for locating elements and handling waits. "
+        f"Assume Chrome WebDriver is installed and available in PATH or use `webdriver_manager` for setup. "
+        f"The test case is:\n\n{test_case_str}"
+    )
+    
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "tools": [{"google_search": {}}] # Enable grounding for current best practices
+    }
+
+    api_response = call_gemini_api_with_retry(payload)
+    
+    try:
+        script_text = api_response['candidates'][0]['content']['parts'][0]['text']
+        
+        # Simple extraction of the first Python code block (assuming the model outputs Python code)
+        if '```python' in script_text:
+            script = script_text.split('```python')[1].split('```')[0].strip()
+        else:
+            script = script_text.strip()
+            
+        return {"script": script}
+    except KeyError:
+        raise HTTPException(status_code=500, detail="LLM failed to return a valid script.")
