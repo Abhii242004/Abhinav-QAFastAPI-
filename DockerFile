@@ -1,5 +1,4 @@
 # Use a lightweight official Python image suitable for production
-# Using a specific version (3.11-slim) ensures reproducibility and a smaller image size
 FROM python:3.11-slim
 
 # Set environment variables
@@ -9,30 +8,29 @@ ENV PYTHONDONTWRITEBYTECODE 1
 # Set the working directory in the container
 WORKDIR /app
 
-# 1. Install System Dependencies for building certain Python packages (like lxml)
-# The `fastapi` and `uvicorn` dependencies themselves don't usually need these,
-# but `lxml` is often included in the `beautifulsoup4` group and benefits from them.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# 2. Copy only requirements.txt first to leverage Docker caching.
-# If requirements.txt doesn't change, this step and the next one are skipped on rebuild.
+# 1. Copy only requirements.txt first to leverage Docker caching.
 COPY requirements.txt .
 
-# 3. Install Python dependencies
-# --no-cache-dir saves space, and --default-timeout is a safety measure against slow downloads
-RUN pip install --no-cache-dir --upgrade pip
-# Set a generous timeout for installing heavy dependencies
-RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
+# 2. Install Dependencies, Build Tools, and then CLEAN UP immediately.
+# This chained RUN command minimizes layers and drastically reduces the final image size
+# by removing the build tools (like build-essential) after they are no longer needed.
+RUN apt-get update && \
+    # Install build tools needed for packages like lxml, numpy, etc.
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/* && \
+    \
+    # Install Python dependencies with a generous timeout (300 seconds)
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir --timeout 300 -r requirements.txt && \
+    \
+    # CLEAN UP: Uninstall the build tools to shrink the final image size
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
-# 4. Copy the rest of the application code
+# 3. Copy the rest of the application code
 COPY . .
 
-# 5. Define the command to run your application using the corrected start command
-# We use uvicorn directly, as defined in your start_command_fix.txt
-# Using gunicorn/waitress is usually better for production for better worker management,
-# but since you are using uvicorn directly in your start command, we stick to that.
+# 4. Define the command to run your application
 # The host/port are picked up automatically by Railway.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "$PORT"]
