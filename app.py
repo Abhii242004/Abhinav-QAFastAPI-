@@ -26,7 +26,7 @@ from fastembed.text.text_embedding import TextEmbedding
 # --- Configuration and Initialization ---
 
 # Check for API Key provided by the runtime environment
-API_KEY = "AIzaSyAptZ-5xnbs7k4Y9Q5PUp1-C8NlyAEzuWY"
+API_KEY = os.environ.get("__api_key", "")
 if not API_KEY:
     # Fallback/Placeholder message if running outside the intended environment
     print("Warning: __api_key environment variable not found. Using empty string.")
@@ -43,7 +43,7 @@ app = FastAPI(
     description="Backend for AI-powered QA and test script generation."
 )
 
-# --- Pydantic Schemas (omitted for brevity, they are unchanged) ---
+# --- Pydantic Schemas ---
 
 class UploadDocsPayload(BaseModel):
     """Payload for ingesting new documents."""
@@ -68,7 +68,7 @@ class TestStep(BaseModel):
 
 class GeneratedTestCase(BaseModel):
     """The structured output for a test case."""
-    test_case_id: str
+    test_case_id: str = Field(..., description="A unique identifier for the test case, e.g., 'TC_LOGIN_001'.")
     title: str = Field(..., description="A concise title for the test case.")
     description: str = Field(..., description="A brief overview of the test objective.")
     priority: str = Field("Medium", description="Priority level: High, Medium, or Low.")
@@ -78,7 +78,7 @@ class GeneratedTestCase(BaseModel):
 TEST_CASE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "test_case_id": {"type": "STRING"},
+        "test_case_id": {"type": "STRING", "description": "A unique identifier for the test case, e.g., 'TC_PROMO_007'."},
         "title": {"type": "STRING"},
         "description": {"type": "STRING"},
         "priority": {"type": "STRING", "enum": ["High", "Medium", "Low"]},
@@ -97,10 +97,11 @@ TEST_CASE_SCHEMA = {
             }
         }
     },
-    "propertyOrdering": ["test_case_id", "title", "description", "priority", "steps"]
+    # CRITICAL FIX: Ensure test_case_id is explicitly ordered first to remind the LLM
+    "propertyOrdering": ["test_case_id", "title", "description", "priority", "steps"] 
 }
 
-# --- ChromaDB Setup with fastembed (omitted for brevity, unchanged) ---
+# --- ChromaDB Setup with fastembed (unchanged) ---
 
 def get_chroma_client_and_collection():
     """Initializes and returns the ChromaDB client and collection."""
@@ -137,7 +138,7 @@ def startup_db_client():
     print(f"ChromaDB initialized. Knowledge base size: {knowledge_base.count()} documents.")
 
 
-# --- Gemini API Helper Function (with retry logic) ---
+# --- Gemini API Helper Function (with retry logic) (unchanged) ---
 
 def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) -> Dict[str, Any]:
     """Handles API calls with exponential backoff and improved key check."""
@@ -181,7 +182,7 @@ def call_gemini_api_with_retry(payload: Dict[str, Any], max_retries: int = 5) ->
     raise HTTPException(status_code=500, detail="Gemini API failed after multiple retries.")
 
 
-# --- Endpoints (omitted for brevity, unchanged functionality) ---
+# --- Endpoints ---
 
 @app.get("/")
 def read_root():
@@ -273,9 +274,10 @@ def generate_test_cases(payload: QueryPayload):
     # System Instruction: Guide the model's persona and output format
     system_prompt = (
         "You are an expert QA Engineer. Your task is to generate a comprehensive, structured test case "
-        "in the exact JSON format provided in the schema. Use the provided RAG Context to inform "
-        "the precise details for UI interactions (e.g., specific form fields, expected messages). "
-        "Ensure 'element_identifier' is a precise description (e.g., 'Login button', 'Email input field')."
+        "in the exact JSON format provided in the schema. **You must include the 'test_case_id' field**, "
+        "using a descriptive format like 'TC_FEATURE_XXX' (e.g., 'TC_LOGIN_001'). "
+        "Use the provided RAG Context to inform the precise details for UI interactions "
+        "(e.g., specific form fields, expected messages). Ensure 'element_identifier' is a precise description."
     )
     
     # User Prompt: The specific instruction for the LLM
@@ -302,11 +304,14 @@ def generate_test_cases(payload: QueryPayload):
         test_case_data = json.loads(json_string)
         
         # Validate the generated data against the Pydantic model
+        # NOTE: Pydantic will raise a ValidationError if test_case_id is missing.
         return GeneratedTestCase(**test_case_data)
     except (KeyError, json.JSONDecodeError, ValueError) as e:
+        # Include the raw text of the response in the error detail for easier debugging
+        raw_text_snippet = json_string[:500] if 'json_string' in locals() else 'Response text not available.'
         print(f"Failed to parse or validate JSON response: {e}")
-        print(f"Raw API response: {api_response}")
-        raise HTTPException(status_code=500, detail="LLM failed to return valid structured JSON.")
+        print(f"Raw API response JSON: {api_response}")
+        raise HTTPException(status_code=500, detail=f"LLM failed to return valid structured JSON. Validation Error: {e}. Raw LLM Output start: {raw_text_snippet}")
 
 
 @app.post("/generate_selenium")
@@ -370,4 +375,3 @@ def generate_selenium(payload: SeleniumPayload):
         print(f"Script extraction failed: {e}. Raw response: {script_text[:100]}...")
         # If extraction or parsing fails, return the raw text for debugging
         return {"script": f"Error: Failed to generate script. Raw LLM output: {script_text}", "detail": str(e)}
-
