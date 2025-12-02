@@ -7,3 +7,4 @@ requests
 chromadb
 fastembed
 pysqlite3-binary
+python-dotenv
