@@ -1,0 +1,19 @@
+    name: My Python Workflow
+
+    on: [push]
+
+    jobs:
+      build:
+        runs-on: ubuntu-latest
+        steps:
+        - uses: actions/checkout@v4
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.x'
+        - name: Install dependencies
+          run: pip install python-dotenv  # If needed for local testing, otherwise not essential here
+        - name: Run script with API key
+          env:
+            API_KEY: ${{ secrets.GEMINI_KEY }}  # Access the secret here
+          run: python app.py
